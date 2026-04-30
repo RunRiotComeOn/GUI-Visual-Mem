@@ -1,0 +1,32 @@
+# GUIMem launcher config for static Multimodal-Mind2Web-style offline rows.
+# Run:
+#   python evaluate.py --config configs/offline_multimodal_mind2web.yaml --dry-run
+benchmark: offline
+
+env:
+  OPENAI_MODEL: gpt-4o-mini
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+  # Enable task-specific memory.
+  MEMORY_MODEL: gpt-4o-mini
+  MEMORY_API_BASE: https://api.openai.com/v1
+  MEMORY_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_RECENT_K: "3"
+
+  # Enable cross-task memory when these files exist.
+  SELECTOR_MODEL: gpt-4o-mini
+  SELECTOR_API_BASE: https://api.openai.com/v1
+  SELECTOR_API_KEY: ${OPENAI_API_KEY}
+  EXPERIENCE_CATALOG_PATH: outputs/cross_task_experience/catalog.json
+  EXPERIENCE_LIBRARY_PATH: outputs/cross_task_experience/experience_library.jsonl
+
+args:
+  benchmark: multimodal_mind2web
+  input_file: data/offline/mind2web_eval.jsonl
+  output_file: outputs/offline/mind2web_predictions.jsonl
+  blocks: data/offline/blocks
+  model: gpt-4o-mini
+  api_base: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  temperature: 0.0

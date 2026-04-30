@@ -1,0 +1,27 @@
+# GUIMem launcher config for static AndroidControl-style offline rows.
+benchmark: offline
+
+env:
+  OPENAI_MODEL: gpt-4o-mini
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_MODEL: gpt-4o-mini
+  MEMORY_API_BASE: https://api.openai.com/v1
+  MEMORY_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_RECENT_K: "3"
+  SELECTOR_MODEL: gpt-4o-mini
+  SELECTOR_API_BASE: https://api.openai.com/v1
+  SELECTOR_API_KEY: ${OPENAI_API_KEY}
+  EXPERIENCE_CATALOG_PATH: outputs/cross_task_experience/catalog.json
+  EXPERIENCE_LIBRARY_PATH: outputs/cross_task_experience/experience_library.jsonl
+
+args:
+  benchmark: android_control
+  input_file: data/offline/android_control_eval.jsonl
+  output_file: outputs/offline/android_control_predictions.jsonl
+  screenshot_dir: data/offline/android_control_screenshots
+  level: high
+  model: gpt-4o-mini
+  api_base: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  temperature: 0.0

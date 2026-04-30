@@ -1,0 +1,13 @@
+# GUIMem launcher config for WebArenaLiteV2.
+benchmark: webarena_lite
+
+env:
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+args:
+  env_config_path: configs/webarena_lite/env.yaml
+  agent_config_path: configs/webarena_lite/agent_memory.yaml
+  task_config_path: evaluation/WebArenaLiteV2/tasks
+  num_workers: 1
+  exp_name: guimem_webarena_lite
+  max_steps: 15

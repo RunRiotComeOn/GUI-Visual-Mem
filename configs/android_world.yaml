@@ -1,0 +1,22 @@
+# GUIMem launcher config for Android World using the native runner.
+# Android World reads most model settings from environment variables.
+benchmark: android_world
+
+env:
+  OPENAI_MODEL: gpt-4o-mini
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  OPENAI_TEMPERATURE: "0"
+
+  MEMORY_MODEL: gpt-4o-mini
+  MEMORY_API_BASE: https://api.openai.com/v1
+  MEMORY_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_RECENT_K: "3"
+
+  SELECTOR_MODEL: gpt-4o-mini
+  SELECTOR_API_BASE: https://api.openai.com/v1
+  SELECTOR_API_KEY: ${OPENAI_API_KEY}
+  EXPERIENCE_CATALOG_PATH: outputs/cross_task_experience/catalog.json
+  EXPERIENCE_LIBRARY_PATH: outputs/cross_task_experience/experience_library.jsonl
+
+args: []

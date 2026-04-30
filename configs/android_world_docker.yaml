@@ -1,0 +1,23 @@
+# GUIMem launcher config for Android World through the Docker gateway.
+benchmark: android_world_docker
+
+env:
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_MODEL: gpt-4o-mini
+  MEMORY_API_BASE: https://api.openai.com/v1
+  MEMORY_API_KEY: ${OPENAI_API_KEY}
+  MEMORY_RECENT_K: "3"
+  SELECTOR_MODEL: gpt-4o-mini
+  SELECTOR_API_BASE: https://api.openai.com/v1
+  SELECTOR_API_KEY: ${OPENAI_API_KEY}
+  EXPERIENCE_CATALOG_PATH: outputs/cross_task_experience/catalog.json
+  EXPERIENCE_LIBRARY_PATH: outputs/cross_task_experience/experience_library.jsonl
+
+args:
+  model: gpt-4o-mini
+  base_url: https://api.openai.com/v1
+  temperature: 0.0
+  env_url: http://localhost:5000
+  max_steps: 20
+  output_path: outputs/android_world_docker
+  task_index: -1

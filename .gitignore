@@ -1,0 +1,45 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and package caches
+.venv/
+.venv-*/
+venv/
+env/
+.uv-cache/
+
+# Project data, generated artifacts, and experiment outputs
+data/
+outputs/
+*.log
+*.out
+*.err
+
+# Slurm generated files
+slurm-*.out
+slurm-*.err
+
+# Local editor and tool state
+.claude/settings.local.json
+.codex
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db

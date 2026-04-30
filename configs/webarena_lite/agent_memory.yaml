@@ -1,0 +1,23 @@
+model_config:
+  # Policy model.
+  policy_model: gpt-4o-mini
+  policy_api_base: https://api.openai.com/v1
+  policy_api_key: ${OPENAI_API_KEY}
+  policy_temperature: 0.0
+  policy_rate_limit: -1
+
+  # Task-specific memory.
+  memory_model: gpt-4o-mini
+  memory_api_base: https://api.openai.com/v1
+  memory_api_key: ${OPENAI_API_KEY}
+  memory_recent_k: 3
+
+  # Cross-task experience selector.
+  selector_model: gpt-4o-mini
+  selector_api_base: https://api.openai.com/v1
+  selector_api_key: ${OPENAI_API_KEY}
+  experience_catalog_path: outputs/cross_task_experience/catalog.json
+  experience_library_path: outputs/cross_task_experience/experience_library.jsonl
+
+  history_last_k: 15
+  max_policy_tokens: 4096
