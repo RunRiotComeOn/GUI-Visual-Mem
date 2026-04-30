@@ -200,6 +200,8 @@ class VisualSkillCandidate:
     dominant_actions: list[str]
     representative: VisualSkillOccurrence
     confidence: float
+    family: str = ""
+    variant: str = ""
 
 
 @dataclass
@@ -214,6 +216,9 @@ class VisualSkillMiningConfig:
     catalog_cap: int = 200
     include_single_step_skills: bool = True
     filter_low_information_skills: bool = True
+    compact_v3_skills: bool = True
+    v3_keep_single_step_skills: bool = False
+    v3_subsequence_task_coverage_threshold: float = 0.65
 
 
 def load_offline_steps(
@@ -326,6 +331,143 @@ def mine_visual_skill_candidates(
     return candidates
 
 
+def compact_visual_skill_v3_candidates(
+    candidates: Sequence[VisualSkillCandidate],
+    *,
+    keep_single_step: bool = False,
+    subsequence_task_coverage_threshold: float = 0.65,
+) -> tuple[list[VisualSkillCandidate], dict[str, int]]:
+    """Collapse sliding-window fragments into larger v3 planning skills.
+
+    Mining still counts every contiguous segment so support is measured fairly.
+    This pass decides which segments deserve to be standalone planning skills:
+    single-step affordances are dropped by default, and shorter n-grams are
+    removed when their task support is mostly covered by longer n-grams that
+    contain them as contiguous subsequences.
+    """
+    kept: list[VisualSkillCandidate] = []
+    dropped_single = 0
+    dropped_subsequence = 0
+
+    indexed = [
+        (
+            candidate,
+            _signature_motifs(candidate.signature),
+            _candidate_task_ids(candidate),
+        )
+        for candidate in candidates
+    ]
+
+    for candidate, motifs, task_ids in indexed:
+        if len(motifs) <= 1 and not keep_single_step:
+            dropped_single += 1
+            continue
+
+        longer_matches: list[set[str]] = []
+        for other, other_motifs, other_task_ids in indexed:
+            if other is candidate or len(other_motifs) <= len(motifs):
+                continue
+            if _contains_contiguous_subsequence(other_motifs, motifs):
+                longer_matches.append(other_task_ids)
+
+        if longer_matches and task_ids:
+            covered_tasks = set().union(*longer_matches)
+            coverage = len(task_ids & covered_tasks) / len(task_ids)
+            if coverage >= subsequence_task_coverage_threshold:
+                dropped_subsequence += 1
+                continue
+
+        kept.append(candidate)
+
+    return kept, {
+        "num_candidates_before_compaction": len(candidates),
+        "num_candidates_after_compaction": len(kept),
+        "num_dropped_single_step": dropped_single,
+        "num_dropped_subsequence": dropped_subsequence,
+    }
+
+
+def mine_visual_skill_v3_family_candidates(
+    steps: Sequence[VisualSkillStep],
+    config: VisualSkillMiningConfig | None = None,
+) -> tuple[list[VisualSkillCandidate], dict[str, int]]:
+    """Mine v3 skills as semantic interaction families, not action n-grams."""
+    config = config or VisualSkillMiningConfig()
+    grouped = _group_steps_by_task(steps)
+    occurrences_by_key: dict[tuple[str, str], list[VisualSkillOccurrence]] = defaultdict(list)
+    raw_episode_count = 0
+
+    for task_steps in grouped.values():
+        task_steps = sorted(task_steps, key=lambda item: item.step_index)
+        idx = 0
+        while idx < len(task_steps):
+            episode = _extract_v3_episode_at(task_steps, idx)
+            if episode is None:
+                idx += 1
+                continue
+            family, variant, occurrence, next_idx = episode
+            if len(occurrence.steps) < 2 or _is_low_information_v3_episode(family, occurrence):
+                idx = max(idx + 1, next_idx)
+                continue
+            occurrences_by_key[(family, variant)].append(occurrence)
+            raw_episode_count += 1
+            idx = max(idx + 1, next_idx)
+
+    candidates: list[VisualSkillCandidate] = []
+    for (family, variant), occurrences in occurrences_by_key.items():
+        support_tasks = len({item.task_id for item in occurrences})
+        support_domains = len({item.domain for item in occurrences})
+        if (
+            len(occurrences) < config.min_support
+            or support_tasks < config.min_tasks
+            or support_domains < config.min_domains
+        ):
+            continue
+
+        trimmed = _trim_occurrences(occurrences, config.max_examples_per_skill)
+        representative = _choose_representative(trimmed)
+        dominant_roles = _counter_top(step.target_role for occ in trimmed for step in occ.steps)
+        dominant_actions = _counter_top(step.action_type for occ in trimmed for step in occ.steps)
+        signature = _family_signature_for(family, variant, trimmed)
+        candidates.append(
+            VisualSkillCandidate(
+                skill_id=_v3_skill_id_for_family(family, variant),
+                signature=signature,
+                title=_v3_family_title(family, variant),
+                occurrences=trimmed,
+                support_steps=len(occurrences),
+                support_tasks=support_tasks,
+                support_domains=support_domains,
+                support_apps=len({item.app for item in occurrences}),
+                dominant_roles=dominant_roles,
+                dominant_actions=dominant_actions,
+                representative=representative,
+                confidence=_confidence(
+                    occurrences=occurrences,
+                    support_tasks=support_tasks,
+                    support_domains=support_domains,
+                ),
+                family=family,
+                variant=variant,
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            item.support_tasks,
+            item.support_domains,
+            item.support_steps,
+            item.confidence,
+        ),
+        reverse=True,
+    )
+    return candidates, {
+        "num_v3_raw_episodes": raw_episode_count,
+        "num_v3_family_keys": len(occurrences_by_key),
+        "num_v3_family_candidates": len(candidates),
+    }
+
+
 def build_visual_skill_record(
     candidate: VisualSkillCandidate,
     *,
@@ -387,30 +529,34 @@ def build_visual_skill_v3_record(
     if output_dir and draw_example:
         example_image = _write_annotated_example(candidate, Path(output_dir))
 
-    skill_id = _v3_skill_id_for_signature(candidate.signature)
+    family = candidate.family or _v3_family_from_signature(candidate.signature)
+    variant = candidate.variant or "generic"
+    skill_id = candidate.skill_id or _v3_skill_id_for_family(family, variant)
     action_templates = _action_templates_for(candidate)
     record = {
         "version": "visual_skill_v3",
         "skill_type": "ui_planning_skill",
+        "family": family,
+        "variant": variant,
         "skill_id": skill_id,
         "experience_id": skill_id,
-        "title": _v3_title_for_candidate(candidate),
+        "title": _v3_family_title(family, variant),
         "signature": candidate.signature,
-        "intent": _v3_intent_for(candidate),
+        "intent": _v3_family_intent(family, variant),
         "applicable_context": {
-            "when": _v3_when_for_candidate(candidate),
-            "preconditions": _v3_preconditions_for(candidate),
+            "when": _v3_family_when(family, variant),
+            "preconditions": _v3_family_preconditions(family, variant),
             "page_state_cues": _visual_cues_for(candidate),
             "task_goal_cues": _v3_task_goal_cues_for(candidate),
-            "negative_conditions": [_avoid_for(candidate)],
+            "negative_conditions": _v3_family_negative_conditions(family),
             "domain_hint": _domain_hint_for(candidate),
         },
         "planning": {
-            "procedure": _v3_procedure_for(candidate),
+            "procedure": _v3_family_procedure(family, variant),
             "action_templates": action_templates,
-            "postcondition_checks": _v3_postcondition_checks_for(candidate),
-            "failure_modes": _v3_failure_modes_for(candidate),
-            "recovery_steps": _v3_recovery_steps_for(candidate),
+            "postcondition_checks": _v3_family_postcondition_checks(family),
+            "failure_modes": _v3_family_failure_modes(family),
+            "recovery_steps": _v3_family_recovery_steps(family),
         },
         "retrieval": {
             "query_terms": _v3_query_terms_for(candidate),
@@ -443,10 +589,10 @@ def build_visual_skill_v3_record(
             "num_apps": candidate.support_apps,
             "dominant_roles": candidate.dominant_roles,
             "dominant_actions": candidate.dominant_actions,
-            "action_pattern_agreement": 1.0,
+            "action_pattern_agreement": _v3_action_pattern_agreement(candidate),
             "qualification": (
-                "Mined only after multiple trajectory segments shared the same "
-                "normalized action pattern and passed support/task/domain filters."
+                "Mined only after multiple semantic episodes mapped to the same "
+                "interaction family and passed support/task/domain filters."
             ),
         },
         "confidence": candidate.confidence,
@@ -567,7 +713,7 @@ def mine_visual_skill_v3_from_file(
     """End-to-end offline v3 mining helper."""
     config = config or VisualSkillMiningConfig()
     steps = load_offline_steps(input_path, dataset=dataset, image_root=image_root)
-    candidates = mine_visual_skill_candidates(steps, config=config)
+    candidates, mining_stats = mine_visual_skill_v3_family_candidates(steps, config=config)
     result = write_visual_skill_v3_store(
         candidates,
         output_dir,
@@ -575,6 +721,7 @@ def mine_visual_skill_v3_from_file(
         draw_examples=draw_examples,
     )
     result["num_steps"] = len(steps)
+    result.update(mining_stats)
     return result
 
 
@@ -618,7 +765,7 @@ def mine_visual_skill_v3_from_files(
     steps: list[VisualSkillStep] = []
     for input_path in input_paths:
         steps.extend(load_offline_steps(input_path, dataset=dataset, image_root=image_root))
-    candidates = mine_visual_skill_candidates(steps, config=config)
+    candidates, mining_stats = mine_visual_skill_v3_family_candidates(steps, config=config)
     result = write_visual_skill_v3_store(
         candidates,
         output_dir,
@@ -627,6 +774,7 @@ def mine_visual_skill_v3_from_files(
     )
     result["num_steps"] = len(steps)
     result["num_inputs"] = len(input_paths)
+    result.update(mining_stats)
     return result
 
 
@@ -811,6 +959,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--catalog-cap", type=int, default=200)
     parser.add_argument("--no-single-step", action="store_true")
     parser.add_argument("--keep-low-information", action="store_true")
+    parser.add_argument("--no-v3-compact", action="store_true", help="Disable v3 maximal-segment compaction.")
+    parser.add_argument("--v3-keep-single-step", action="store_true", help="Keep single-step skills in v3 output.")
+    parser.add_argument("--v3-subsequence-task-coverage-threshold", type=float, default=0.65)
     parser.add_argument("--no-images", action="store_true")
     args = parser.parse_args(argv)
 
@@ -823,6 +974,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         catalog_cap=args.catalog_cap,
         include_single_step_skills=not args.no_single_step,
         filter_low_information_skills=not args.keep_low_information,
+        compact_v3_skills=not args.no_v3_compact,
+        v3_keep_single_step_skills=args.v3_keep_single_step,
+        v3_subsequence_task_coverage_threshold=args.v3_subsequence_task_coverage_threshold,
     )
     if args.version == "v3":
         result = mine_visual_skill_v3_from_files(
@@ -1370,6 +1524,8 @@ def _catalog_v3_entry(record: dict[str, Any]) -> dict[str, Any]:
         "skill_id": record["skill_id"],
         "version": "visual_skill_v3",
         "skill_type": record.get("skill_type", "ui_planning_skill"),
+        "family": record.get("family", ""),
+        "variant": record.get("variant", ""),
         "title": record.get("title", ""),
         "intent": record.get("intent", ""),
         "when": context.get("when", ""),
@@ -1413,6 +1569,507 @@ def _parse_signature_parts(signature: str) -> tuple[list[str], list[str], list[s
         if value:
             value_kinds.append(value)
     return roles, actions, value_kinds
+
+
+def _extract_v3_episode_at(
+    steps: Sequence[VisualSkillStep],
+    idx: int,
+) -> tuple[str, str, VisualSkillOccurrence, int] | None:
+    step = steps[idx]
+    if _is_hover_menu_start(step):
+        end = _find_next_matching(
+            steps,
+            idx,
+            lambda item: item.target_role in {"text_option", "menu_control", "tab", "dropdown_or_select"}
+            and item.action_type in {"click", "select"},
+            max_lookahead=4,
+        )
+        if end is not None:
+            occurrence = VisualSkillOccurrence(list(steps[idx : end + 1]))
+            return "hover_menu_navigation", "generic", occurrence, end + 1
+
+    if _is_date_related(step):
+        end = _extend_date_episode(steps, idx)
+        if end > idx:
+            occurrence = VisualSkillOccurrence(list(steps[idx : end + 1]))
+            return "date_picker_selection", "date_or_time", occurrence, end + 1
+
+    if _is_dropdown_related(step):
+        end = _extend_dropdown_episode(steps, idx)
+        if end > idx:
+            occurrence = VisualSkillOccurrence(list(steps[idx : end + 1]))
+            dropdown_count = sum(1 for item in occurrence.steps if item.target_role == "dropdown_or_select")
+            family = "dependent_or_multi_dropdown_form" if dropdown_count >= 2 else "dropdown_option_selection"
+            return family, _episode_value_variant(occurrence), occurrence, end + 1
+
+    if _is_text_input(step):
+        option_end = _find_next_matching(
+            steps,
+            idx,
+            lambda item: item.target_role == "text_option" and item.action_type in {"click", "select"},
+            max_lookahead=3,
+        )
+        if option_end is not None:
+            occurrence = VisualSkillOccurrence(list(steps[idx : option_end + 1]))
+            return "autocomplete_search_selection", _input_variant(step), occurrence, option_end + 1
+
+        submit_end = _find_next_matching(
+            steps,
+            idx,
+            lambda item: item.target_role in {"search_button", "confirm_button"} and item.action_type == "click",
+            max_lookahead=4,
+        )
+        if submit_end is not None:
+            occurrence = VisualSkillOccurrence(list(steps[idx : submit_end + 1]))
+            family = "search_then_submit" if step.target_role == "search_bar" else "form_fill_and_submit"
+            return family, _episode_value_variant(occurrence), occurrence, submit_end + 1
+
+    if _is_form_field(step):
+        end = _extend_form_submit_episode(steps, idx)
+        if end > idx:
+            occurrence = VisualSkillOccurrence(list(steps[idx : end + 1]))
+            return "form_fill_and_submit", _episode_value_variant(occurrence), occurrence, end + 1
+
+    if _is_navigation_start(step):
+        end = _find_next_matching(
+            steps,
+            idx,
+            lambda item: item.target_role in {"text_option", "tab", "menu_control", "search_bar"}
+            and item.action_type in {"click", "input_text", "hover"},
+            max_lookahead=3,
+        )
+        if end is not None:
+            occurrence = VisualSkillOccurrence(list(steps[idx : end + 1]))
+            return "tab_or_menu_navigation", "generic", occurrence, end + 1
+
+    return None
+
+
+def _is_hover_menu_start(step: VisualSkillStep) -> bool:
+    return step.action_type == "hover" or (
+        step.target_role == "menu_control" and _has_any(step.target_text.lower(), ["menu", "navigation", "reservations"])
+    )
+
+
+def _is_date_related(step: VisualSkillStep) -> bool:
+    return step.target_role in {"date_or_time_field", "date_cell"} or step.value_kind == "date_or_time"
+
+
+def _is_dropdown_related(step: VisualSkillStep) -> bool:
+    return step.target_role == "dropdown_or_select" and step.action_type in {"click", "select"}
+
+
+def _is_text_input(step: VisualSkillStep) -> bool:
+    return step.action_type == "input_text" and step.target_role in {"search_bar", "text_field", "date_or_time_field"}
+
+
+def _is_form_field(step: VisualSkillStep) -> bool:
+    return step.action_type in {"input_text", "select"} and step.target_role in {
+        "text_field",
+        "search_bar",
+        "dropdown_or_select",
+        "date_or_time_field",
+    }
+
+
+def _is_navigation_start(step: VisualSkillStep) -> bool:
+    return step.action_type in {"click", "hover"} and step.target_role in {"tab", "menu_control", "text_option"}
+
+
+def _find_next_matching(
+    steps: Sequence[VisualSkillStep],
+    idx: int,
+    predicate,
+    *,
+    max_lookahead: int,
+) -> int | None:
+    limit = min(len(steps), idx + max_lookahead + 1)
+    for pos in range(idx + 1, limit):
+        if predicate(steps[pos]):
+            return pos
+        if _is_hard_episode_boundary(steps[pos]):
+            return None
+    return None
+
+
+def _extend_dropdown_episode(steps: Sequence[VisualSkillStep], idx: int) -> int:
+    end = idx
+    limit = min(len(steps), idx + 6)
+    for pos in range(idx + 1, limit):
+        item = steps[pos]
+        if item.target_role in {"dropdown_or_select", "text_option"} and item.action_type in {"click", "select"}:
+            end = pos
+            continue
+        if item.target_role in {"confirm_button", "search_button"} and item.action_type == "click" and end > idx:
+            return pos
+        break
+    return end
+
+
+def _extend_date_episode(steps: Sequence[VisualSkillStep], idx: int) -> int:
+    end = idx
+    limit = min(len(steps), idx + 6)
+    for pos in range(idx + 1, limit):
+        item = steps[pos]
+        if item.target_role in {"date_or_time_field", "date_cell", "dropdown_or_select", "text_option"} or item.value_kind == "date_or_time":
+            end = pos
+            continue
+        if item.target_role in {"confirm_button", "search_button"} and item.action_type == "click" and end > idx:
+            return pos
+        break
+    return end
+
+
+def _extend_form_submit_episode(steps: Sequence[VisualSkillStep], idx: int) -> int:
+    field_count = 1
+    end = idx
+    limit = min(len(steps), idx + 7)
+    for pos in range(idx + 1, limit):
+        item = steps[pos]
+        if _is_form_field(item) or (item.target_role == "text_option" and item.action_type in {"click", "select"}):
+            field_count += 1 if _is_form_field(item) else 0
+            end = pos
+            continue
+        if item.target_role in {"confirm_button", "search_button"} and item.action_type == "click":
+            return pos if field_count >= 1 else end
+        if _is_hard_episode_boundary(item):
+            break
+    return end if field_count >= 2 else idx
+
+
+def _is_hard_episode_boundary(step: VisualSkillStep) -> bool:
+    return step.action_type in {"scroll", "press_key"} or step.target_role in {"dismiss_or_back_control"}
+
+
+def _is_low_information_v3_episode(family: str, occurrence: VisualSkillOccurrence) -> bool:
+    if family in {
+        "autocomplete_search_selection",
+        "dependent_or_multi_dropdown_form",
+        "dropdown_option_selection",
+        "date_picker_selection",
+        "form_fill_and_submit",
+        "search_then_submit",
+        "hover_menu_navigation",
+    }:
+        return False
+    if all(step.action_type == "click" and step.value_kind == "none" for step in occurrence.steps):
+        return True
+    return False
+
+
+def _input_variant(step: VisualSkillStep) -> str:
+    return f"{step.target_role}:{_value_family(step.value_kind)}"
+
+
+def _episode_value_variant(occurrence: VisualSkillOccurrence) -> str:
+    value_families = [_value_family(step.value_kind) for step in occurrence.steps if _value_family(step.value_kind) != "none"]
+    if "date_or_time" in value_families:
+        return "date_or_time"
+    if "query" in value_families:
+        return "query"
+    if "option" in value_families:
+        return "option"
+    return "generic"
+
+
+def _value_family(value_kind: str) -> str:
+    if value_kind == "date_or_time":
+        return "date_or_time"
+    if value_kind == "query":
+        return "query"
+    if value_kind in {"option", "number"}:
+        return "option"
+    return value_kind or "none"
+
+
+def _family_signature_for(
+    family: str,
+    variant: str,
+    occurrences: Sequence[VisualSkillOccurrence],
+) -> str:
+    signatures = Counter(occurrence.signature for occurrence in occurrences)
+    if signatures:
+        return signatures.most_common(1)[0][0]
+    return f"{family}:{variant}"
+
+
+def _v3_skill_id_for_family(family: str, variant: str) -> str:
+    key = f"{family}:{variant}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    slug = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    return f"v3_{slug[:64]}_{digest}"
+
+
+def _v3_family_from_signature(signature: str) -> str:
+    roles, actions, value_kinds = _parse_signature_parts(signature)
+    if "date_cell" in roles or "date_or_time_field" in roles or "date_or_time" in value_kinds:
+        return "date_picker_selection"
+    if "dropdown_or_select" in roles and "text_option" in roles:
+        return "dropdown_option_selection"
+    if "search_bar" in roles and "input_text" in actions and "text_option" in roles:
+        return "autocomplete_search_selection"
+    if "search_button" in roles:
+        return "search_then_submit"
+    if "confirm_button" in roles:
+        return "form_fill_and_submit"
+    if "menu_control" in roles and "hover" in actions:
+        return "hover_menu_navigation"
+    return "tab_or_menu_navigation"
+
+
+def _v3_family_title(family: str, variant: str) -> str:
+    titles = {
+        "autocomplete_search_selection": "Autocomplete Search Selection",
+        "dropdown_option_selection": "Dropdown Option Selection",
+        "dependent_or_multi_dropdown_form": "Dependent Or Multi-Dropdown Form",
+        "date_picker_selection": "Date Picker Selection",
+        "form_fill_and_submit": "Form Fill And Submit",
+        "search_then_submit": "Search Then Submit",
+        "hover_menu_navigation": "Hover Menu Navigation",
+        "tab_or_menu_navigation": "Tab Or Menu Navigation",
+    }
+    title = titles.get(family, family.replace("_", " ").title())
+    if variant and variant not in {"generic", "none"}:
+        title += f" ({variant.replace(':', ', ').replace('_', ' ')})"
+    return title
+
+
+def _v3_family_intent(family: str, variant: str) -> str:
+    intents = {
+        "autocomplete_search_selection": "Enter a task value into a search or text field and select the matching suggestion/result.",
+        "dropdown_option_selection": "Open or use a dropdown/select control and choose the option that matches the task.",
+        "dependent_or_multi_dropdown_form": "Fill related dropdown controls in a form, respecting dependencies between broad and specific fields.",
+        "date_picker_selection": "Choose a requested date or time through a date/time field, calendar, or related selector.",
+        "form_fill_and_submit": "Fill visible form fields or filters and commit them with the relevant apply/search/submit control.",
+        "search_then_submit": "Enter a query into a search field and submit it through the page's search affordance.",
+        "hover_menu_navigation": "Expose menu choices by hovering a navigation/menu control and then choose the relevant option.",
+        "tab_or_menu_navigation": "Navigate through visible tabs, menu items, or category options to reach the requested section.",
+    }
+    return intents.get(family, "Reuse a recurring UI interaction strategy for the current page state.")
+
+
+def _v3_family_when(family: str, variant: str) -> str:
+    return f"Use when the current task and visible page state match the {family.replace('_', ' ')} interaction family."
+
+
+def _v3_family_preconditions(family: str, variant: str) -> list[str]:
+    mapping = {
+        "autocomplete_search_selection": [
+            "A search/text field is visible and the task provides a value to enter.",
+            "The page is likely to show suggestions, options, or matching results after typing.",
+        ],
+        "dropdown_option_selection": [
+            "A dropdown/select control is visible or already open.",
+            "The task specifies an option that should be chosen from that control.",
+        ],
+        "dependent_or_multi_dropdown_form": [
+            "Multiple related dropdown/select controls appear in the same form or filter panel.",
+            "Later fields may depend on earlier selections.",
+        ],
+        "date_picker_selection": [
+            "A date/time field, calendar, date cell, or date/time selector is visible.",
+            "The task contains a date or time constraint.",
+        ],
+        "form_fill_and_submit": [
+            "A form or filter panel contains fields matching the task constraints.",
+            "A Search, Apply, Submit, Done, Continue, or Confirm control is available after filling values.",
+        ],
+        "search_then_submit": [
+            "A search field is visible and the task provides a query.",
+            "The page has a search icon/button or submit affordance.",
+        ],
+        "hover_menu_navigation": [
+            "A navigation/menu control is visible and can expose more options on hover.",
+            "The target section is likely nested under that menu.",
+        ],
+        "tab_or_menu_navigation": [
+            "Tabs, menu items, categories, or section links are visible.",
+            "The task requires moving to a specific section before acting.",
+        ],
+    }
+    return mapping.get(family, ["The current page state matches the historical interaction evidence."])
+
+
+def _v3_family_procedure(family: str, variant: str) -> list[str]:
+    mapping = {
+        "autocomplete_search_selection": [
+            "Focus the search/text field that corresponds to the task slot.",
+            "Enter the task-provided query or value.",
+            "Wait for suggestions, autocomplete options, or matching results to appear.",
+            "Select the suggestion/result that best matches the task value.",
+            "If no suggestion appears, retry the query or submit it directly if the page supports that.",
+        ],
+        "dropdown_option_selection": [
+            "Open the dropdown/select control if it is not already open.",
+            "Inspect the visible options and choose the one matching the task value.",
+            "If the desired option is not visible, scroll within the dropdown or reopen it after a short wait.",
+            "Verify the chosen value is displayed before moving on.",
+        ],
+        "dependent_or_multi_dropdown_form": [
+            "Identify the related dropdowns in the same form or filter panel.",
+            "Fill broad/category fields before dependent or more specific fields.",
+            "After each selection, wait briefly for downstream options to refresh or become enabled.",
+            "Continue selecting values from general to specific.",
+            "Commit the form only after the visible selected values match the task.",
+        ],
+        "date_picker_selection": [
+            "Open the date/time field or calendar control if needed.",
+            "Navigate to the requested month/time range when it is not visible.",
+            "Select the date/time cell or option matching the task.",
+            "Click Done, Apply, or Confirm if the date picker requires an explicit commit.",
+            "Verify the selected date/time appears in the field or page state.",
+        ],
+        "form_fill_and_submit": [
+            "Map each task constraint to the visible form field or filter control.",
+            "Fill text fields and select dropdown/filter values in the form.",
+            "Check that required values are visible and no required field is still empty.",
+            "Click the Search, Apply, Submit, Done, Continue, or Confirm control.",
+            "Verify the page advances to results or a committed state.",
+        ],
+        "search_then_submit": [
+            "Focus the search field matching the task.",
+            "Enter the query from the task goal.",
+            "Submit using the search icon/button or equivalent keyboard/page affordance.",
+            "Verify results or a search results page appears.",
+        ],
+        "hover_menu_navigation": [
+            "Hover the relevant top-level menu or navigation control.",
+            "Wait for the submenu or flyout options to appear.",
+            "Click the option that matches the requested section or subgoal.",
+            "If the menu disappears, hover again and choose the option more directly.",
+        ],
+        "tab_or_menu_navigation": [
+            "Identify the visible tab/menu/category matching the current subgoal.",
+            "Click that navigation option.",
+            "If a second-level option appears, choose the one matching the task.",
+            "Continue only after the page/section visibly changes.",
+        ],
+    }
+    return mapping.get(family, ["Apply the reusable interaction strategy only when the current page matches the preconditions."])
+
+
+def _v3_family_postcondition_checks(family: str) -> list[str]:
+    mapping = {
+        "autocomplete_search_selection": ["A matching suggestion/result is selected or the query is accepted."],
+        "dropdown_option_selection": ["The selected dropdown value is visible in the control or filter state."],
+        "dependent_or_multi_dropdown_form": ["Dependent controls refresh and all required selected values are visible."],
+        "date_picker_selection": ["The requested date/time appears in the field or committed page state."],
+        "form_fill_and_submit": ["The page advances to results, filtered content, or a confirmed state."],
+        "search_then_submit": ["Search results or a query-specific page appears."],
+        "hover_menu_navigation": ["The target submenu option is clicked and the page/section changes."],
+        "tab_or_menu_navigation": ["The requested section/tab/category becomes active."],
+    }
+    return mapping.get(family, ["The page state changes in the direction implied by the task."])
+
+
+def _v3_family_failure_modes(family: str) -> list[str]:
+    mapping = {
+        "autocomplete_search_selection": [
+            "Suggestions do not appear after typing.",
+            "Multiple suggestions look similar.",
+            "A typed value is accepted but not selected from the suggestion list.",
+        ],
+        "dropdown_option_selection": [
+            "The dropdown closes before selection.",
+            "The desired option is below the visible dropdown area.",
+            "The control looks like a dropdown but is disabled.",
+        ],
+        "dependent_or_multi_dropdown_form": [
+            "A dependent dropdown is disabled or empty until an earlier value is selected.",
+            "Options refresh asynchronously after each selection.",
+            "A downstream value is reset when an upstream field changes.",
+        ],
+        "date_picker_selection": [
+            "The calendar opens on the wrong month.",
+            "The date picker requires a separate Done/Apply click.",
+            "The desired date/time is hidden behind calendar navigation.",
+        ],
+        "form_fill_and_submit": [
+            "The submit/apply button is below the fold.",
+            "A required field remains empty.",
+            "A modal, consent banner, or loading state blocks the form.",
+        ],
+        "search_then_submit": [
+            "The search icon/button is not immediately visible.",
+            "Typing updates suggestions but does not submit.",
+        ],
+        "hover_menu_navigation": [
+            "The submenu disappears when the pointer leaves the menu.",
+            "The desired option is nested one level deeper.",
+        ],
+        "tab_or_menu_navigation": [
+            "The clicked tab/menu item opens a submenu instead of navigating.",
+            "The page changes sections without a full navigation.",
+        ],
+    }
+    return mapping.get(family, ["The current page no longer matches the skill preconditions."])
+
+
+def _v3_family_recovery_steps(family: str) -> list[str]:
+    mapping = {
+        "autocomplete_search_selection": [
+            "Refocus the input and type the query again if suggestions vanish.",
+            "Use the closest exact-text suggestion when several options are similar.",
+        ],
+        "dropdown_option_selection": [
+            "Reopen the dropdown and scroll inside it if the option is not visible.",
+            "Wait briefly if the control appears disabled or still loading.",
+        ],
+        "dependent_or_multi_dropdown_form": [
+            "Return to the broadest field and refill dependent fields in order.",
+            "Wait and reopen downstream dropdowns after each upstream selection.",
+        ],
+        "date_picker_selection": [
+            "Use calendar next/previous controls to reach the requested month.",
+            "Click Done/Apply after selecting the date if the field did not update.",
+        ],
+        "form_fill_and_submit": [
+            "Scroll within the form/page to find the commit button.",
+            "Review visible required fields before submitting again.",
+        ],
+        "search_then_submit": [
+            "Try the visible search icon/button, then keyboard submit if appropriate.",
+        ],
+        "hover_menu_navigation": [
+            "Hover the top-level menu again and move directly to the target option.",
+        ],
+        "tab_or_menu_navigation": [
+            "If the first click only expands choices, select the matching child option.",
+        ],
+    }
+    return mapping.get(family, ["Stop using this skill if the current page state no longer matches."])
+
+
+def _v3_family_negative_conditions(family: str) -> list[str]:
+    return [
+        "Do not use this skill when the current page lacks the stated UI family.",
+        "Do not use this skill only because the task text is similar; the visible page state must also match.",
+    ]
+
+
+def _v3_action_pattern_agreement(candidate: VisualSkillCandidate) -> float:
+    if not candidate.occurrences:
+        return 0.0
+    counts = Counter(occurrence.signature for occurrence in candidate.occurrences)
+    return round(counts.most_common(1)[0][1] / len(candidate.occurrences), 3)
+
+
+def _signature_motifs(signature: str) -> list[str]:
+    return [part for part in str(signature or "").split(" -> ") if part]
+
+
+def _candidate_task_ids(candidate: VisualSkillCandidate) -> set[str]:
+    return {occurrence.task_id for occurrence in candidate.occurrences}
+
+
+def _contains_contiguous_subsequence(longer: Sequence[str], shorter: Sequence[str]) -> bool:
+    if not shorter or len(shorter) >= len(longer):
+        return False
+    short_len = len(shorter)
+    for start in range(0, len(longer) - short_len + 1):
+        if list(longer[start : start + short_len]) == list(shorter):
+            return True
+    return False
 
 
 def _v3_skill_id_for_signature(signature: str) -> str:

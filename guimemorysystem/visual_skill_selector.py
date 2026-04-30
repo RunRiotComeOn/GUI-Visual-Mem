@@ -52,6 +52,8 @@ Selection rules:
 - For scroll or key-only skills, no bounding box is needed. For localized
   skills, describe the expected target visually, but do not invent coordinates.
 - Output strict JSON only.
+- Keep every string value to one short line. Do not put double quotes or
+  newline characters inside string values.
 - Set confidence >= 0.7 only when you are highly certain the skill applies to
   the CURRENT step. Lower confidence means the skill should not be used.
 - If the next action is most likely a simple button/link click with no text
@@ -95,6 +97,8 @@ Return JSON:
   "selector_notes": "<brief note if helpful>"
 }}
 """
+
+VISUAL_SKILL_SELECTOR_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,7 @@ def select_visual_skills(
             {"role": "user", "content": content},
         ],
         max_tokens=max_tokens,
+        response_format=VISUAL_SKILL_SELECTOR_RESPONSE_FORMAT,
     )
     parsed = _extract_json_object(raw)
     if parsed.get("no_skill_needed"):
@@ -709,8 +714,73 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("no JSON object found in selector output")
-    parsed = json.loads(text[start : end + 1])
+        parsed = _extract_selector_fallback(text)
+        if parsed is None:
+            raise ValueError("no JSON object found in selector output")
+        return parsed
+    json_text = text[start : end + 1]
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        parsed = _extract_selector_fallback(json_text)
+        if parsed is None:
+            raise ValueError(f"invalid selector JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError("selector JSON must be an object")
     return parsed
+
+
+def _extract_selector_fallback(text: str) -> dict[str, Any] | None:
+    """Recover useful selector decisions from common malformed JSON replies.
+
+    The selector is deliberately VLM-based, so occasional unescaped quotes in
+    free-text evidence fields should not disable the whole v3 mechanism.  This
+    fallback only trusts explicit ``skill_id`` mentions inside a response that
+    otherwise looks like a selector JSON object; candidate filtering and
+    confidence thresholds still happen in ``_parse_selected_skills``.
+    """
+    if not text or "selected_skills" not in text:
+        return None
+    if re.search(r'"?no_skill_needed"?\s*:\s*true\b', text, flags=re.IGNORECASE):
+        return {"selected_skills": [], "no_skill_needed": True, "selector_notes": "fallback parsed no_skill_needed"}
+
+    rows: list[dict[str, Any]] = []
+    skill_matches = list(re.finditer(r'"?skill_id"?\s*:\s*"([^"]+)"', text))
+    for idx, match in enumerate(skill_matches):
+        skill_id = match.group(1).strip()
+        if not skill_id:
+            continue
+        row_text = text[match.start() : skill_matches[idx + 1].start() if idx + 1 < len(skill_matches) else len(text)]
+        rows.append(
+            {
+                "skill_id": skill_id,
+                "confidence": _fallback_float(row_text, "confidence", default=0.7),
+                "matched_visual_evidence": _fallback_string(row_text, "matched_visual_evidence"),
+                "matched_skill_evidence": _fallback_string(row_text, "matched_skill_evidence"),
+                "expected_target_description": _fallback_string(row_text, "expected_target_description"),
+                "suggested_plan": _fallback_string(row_text, "suggested_plan"),
+                "reason": _fallback_string(row_text, "reason") or "Recovered from malformed selector JSON.",
+                "slot_values": {},
+            }
+        )
+    if not rows:
+        return None
+    return {
+        "selected_skills": rows,
+        "no_skill_needed": False,
+        "selector_notes": "recovered from malformed selector JSON",
+    }
+
+
+def _fallback_float(text: str, key: str, *, default: float) -> float:
+    match = re.search(rf'"?{re.escape(key)}"?\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+    if not match:
+        return default
+    return _clamp_float(match.group(1), 0.0, 1.0)
+
+
+def _fallback_string(text: str, key: str) -> str:
+    match = re.search(rf'"?{re.escape(key)}"?\s*:\s*"([^"\n\r]*)"', text)
+    if not match:
+        return ""
+    return match.group(1).strip()

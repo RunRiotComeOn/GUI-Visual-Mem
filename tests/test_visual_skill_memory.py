@@ -6,6 +6,7 @@ from PIL import Image
 
 from guimemorysystem.visual_skill_memory import (
     VisualSkillMiningConfig,
+    compact_visual_skill_v3_candidates,
     infer_target_role,
     load_offline_steps,
     mine_visual_skill_candidates,
@@ -211,6 +212,56 @@ def test_v3_skill_requires_supported_segments_and_writes_planning_schema(tmp_pat
     assert "planning" in record
     assert any("dependent dropdown" in item.lower() for item in record["planning"]["failure_modes"])
     assert record["support"]["num_tasks"] == 3
+
+
+def test_v3_compaction_drops_single_steps_and_covered_subsequences():
+    rows = []
+    for idx in range(4):
+        rows.extend(
+            [
+                {
+                    "task_id": f"task_{idx}",
+                    "source_id": f"task_{idx}_0",
+                    "step": 0,
+                    "task": f"Search for item {idx}",
+                    "action_type": "input_text",
+                    "action_value": f"item {idx}",
+                    "bbox": [10, 10, 100, 20],
+                    "target_text": "Search",
+                },
+                {
+                    "task_id": f"task_{idx}",
+                    "source_id": f"task_{idx}_1",
+                    "step": 1,
+                    "task": f"Search for item {idx}",
+                    "action_type": "click",
+                    "bbox": [120, 10, 50, 20],
+                    "target_text": "Search",
+                },
+                {
+                    "task_id": f"task_{idx}",
+                    "source_id": f"task_{idx}_2",
+                    "step": 2,
+                    "task": f"Search for item {idx}",
+                    "action_type": "click",
+                    "bbox": [30, 50, 80, 20],
+                    "target_text": "First result",
+                },
+            ]
+        )
+
+    candidates = mine_visual_skill_candidates(
+        normalize_records(rows),
+        VisualSkillMiningConfig(min_support=4, min_tasks=4, max_segment_len=3),
+    )
+    compacted, stats = compact_visual_skill_v3_candidates(candidates)
+    signatures = {candidate.signature for candidate in compacted}
+
+    assert stats["num_dropped_single_step"] > 0
+    assert stats["num_dropped_subsequence"] > 0
+    assert "search_bar:input_text:query -> search_button:click:none -> text_option:click:none" in signatures
+    assert "search_bar:input_text:query" not in signatures
+    assert "search_bar:input_text:query -> search_button:click:none" not in signatures
 
 
 def test_mind2web_role_inference_ignores_task_purpose_text():

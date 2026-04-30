@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 class EngineProtocol(Protocol):
     """Small interface required by ``GUIMemorySystem``."""
 
-    def chat(self, messages: list[dict], max_tokens: int = 300, temperature: float | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 300,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         ...
 
     def chat_with_images(
@@ -64,7 +70,13 @@ class OpenAICompatibleEngine:
             time.sleep(self._next_available_time - now)
         self._next_available_time = max(now, self._next_available_time) + self.request_interval
 
-    def chat(self, messages: list[dict], max_tokens: int = 300, temperature: float | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 300,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         self._wait_for_slot()
         payload = {
             "model": self.model,
@@ -72,6 +84,8 @@ class OpenAICompatibleEngine:
             "max_tokens": max_tokens,
             "temperature": self.temperature if temperature is None else temperature,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         last_error: Exception | None = None
         for attempt_idx in range(self.max_retries):
             try:
@@ -84,6 +98,23 @@ class OpenAICompatibleEngine:
                     json=payload,
                     timeout=self.timeout,
                 )
+                if response.status_code == 400 and "response_format" in payload:
+                    try:
+                        err = response.json().get("error", {})
+                    except ValueError:
+                        err = {}
+                    if err.get("code") == "unsupported_parameter" and "response_format" in err.get("message", ""):
+                        logger.warning("Model/API does not support response_format; retrying without JSON mode.")
+                        payload.pop("response_format", None)
+                        response = requests.post(
+                            f"{self.api_base}/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                            timeout=self.timeout,
+                        )
                 response.raise_for_status()
                 data = response.json()
                 message = data["choices"][0]["message"]

@@ -14,9 +14,11 @@ from guimemorysystem.visual_skill_selector import (
 class FakeVisualSelectorEngine:
     def __init__(self) -> None:
         self.messages = None
+        self.response_format = None
 
-    def chat(self, messages, max_tokens=300, temperature=None):
+    def chat(self, messages, max_tokens=300, temperature=None, response_format=None):
         self.messages = messages
+        self.response_format = response_format
         user_content = messages[1]["content"]
         text = "\n".join(item.get("text", "") for item in user_content if item.get("type") == "text")
         assert "candidate_targets" not in text
@@ -125,13 +127,18 @@ def test_select_visual_skills_uses_current_and_recent_frames_without_candidate_t
     )
 
     assert selection.matched
+    assert engine.response_format == {"type": "json_object"}
     assert selection.selected_skills[0].skill_id == "skill_search"
     assert "input_text(target_bbox, <query>)" in selection.injection
     assert "Donnie Darko" in selection.injection
 
 
 class FakeV3SelectorEngine:
-    def chat(self, messages, max_tokens=300, temperature=None):
+    def __init__(self) -> None:
+        self.response_format = None
+
+    def chat(self, messages, max_tokens=300, temperature=None, response_format=None):
+        self.response_format = response_format
         user_content = messages[1]["content"]
         text = "\n".join(item.get("text", "") for item in user_content if item.get("type") == "text")
         assert "version=visual_skill_v3" in text
@@ -153,6 +160,27 @@ class FakeV3SelectorEngine:
                 "no_skill_needed": False,
             }
         )
+
+
+class FakeMalformedV3SelectorEngine:
+    def __init__(self) -> None:
+        self.response_format = None
+
+    def chat(self, messages, max_tokens=300, temperature=None, response_format=None):
+        self.response_format = response_format
+        return """
+{
+  "selected_skills": [
+    {
+      "skill_id": "v3_dropdown",
+      "confidence": 0.91,
+      "matched_visual_evidence": "current page shows Make and Model dropdowns"
+      "suggested_plan": "select Make first then Model"
+    }
+  ],
+  "no_skill_needed": false
+}
+"""
 
 
 def test_select_visual_skill_v3_renders_procedural_planning():
@@ -187,8 +215,9 @@ def test_select_visual_skill_v3_renders_procedural_planning():
         }
     }
 
+    engine = FakeV3SelectorEngine()
     selection = select_visual_skills(
-        engine=FakeV3SelectorEngine(),
+        engine=engine,
         task="Find a Honda Civic near me",
         current_frame=_image(),
         catalog=catalog,
@@ -199,6 +228,51 @@ def test_select_visual_skill_v3_renders_procedural_planning():
     )
 
     assert selection.matched
+    assert engine.response_format == {"type": "json_object"}
     assert "planning_procedure" in selection.injection
     assert "Select Make first." in selection.injection
     assert "Model dropdown is disabled" in selection.injection
+
+
+def test_select_visual_skill_v3_recovers_malformed_selector_json():
+    catalog = [
+        {
+            "skill_id": "v3_dropdown",
+            "version": "visual_skill_v3",
+            "title": "Plan Select Through Dropdowns",
+            "intent": "Transfer dependent dropdown search planning.",
+            "signature": "dropdown_or_select:select:query -> dropdown_or_select:select:query",
+            "when": "Use when a page has dependent dropdowns.",
+            "preconditions": ["Make/Model dropdowns are visible."],
+            "procedure": ["Select Make first.", "Wait for Model to refresh.", "Select Model."],
+            "support": {"num_trajectory_segments": 5, "num_tasks": 5, "num_domains": 1},
+        }
+    ]
+    library = {
+        "v3_dropdown": {
+            "skill_id": "v3_dropdown",
+            "experience_id": "v3_dropdown",
+            "version": "visual_skill_v3",
+            "title": "Plan Select Through Dropdowns",
+            "intent": "Transfer dependent dropdown search planning.",
+            "applicable_context": {"preconditions": ["Make/Model dropdowns are visible."]},
+            "planning": {"procedure": ["Select Make first.", "Wait for Model to refresh.", "Select Model."]},
+        }
+    }
+
+    engine = FakeMalformedV3SelectorEngine()
+    selection = select_visual_skills(
+        engine=engine,
+        task="Find a Honda Civic near me",
+        current_frame=_image(),
+        catalog=catalog,
+        library=library,
+        current_observation="Make and Model dropdowns are visible.",
+        max_catalog_candidates=1,
+        max_selected_skills=1,
+    )
+
+    assert selection.matched
+    assert engine.response_format == {"type": "json_object"}
+    assert selection.selector_notes == "recovered from malformed selector JSON"
+    assert "Select Make first." in selection.injection

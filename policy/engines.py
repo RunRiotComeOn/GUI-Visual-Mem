@@ -48,7 +48,13 @@ class OpenAICompatibleEngine:
             time.sleep(self._next_available_time - now)
         self._next_available_time = max(now, self._next_available_time) + self.request_interval
 
-    def chat(self, messages: list[dict], max_tokens: int = 300, temperature: float | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 300,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         self._wait_for_slot()
         payload = {
             "model": self.model,
@@ -56,6 +62,8 @@ class OpenAICompatibleEngine:
             "max_tokens": max_tokens,
             "temperature": self.temperature if temperature is None else temperature,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         last_error: Exception | None = None
         for attempt_idx in range(self.max_retries):
             try:
@@ -71,9 +79,28 @@ class OpenAICompatibleEngine:
                 # Some newer models (e.g. gpt-5.x series) reject max_tokens and
                 # require max_completion_tokens instead. Swap and retry once.
                 if response.status_code == 400:
-                    err = response.json().get("error", {})
+                    try:
+                        err = response.json().get("error", {})
+                    except ValueError:
+                        err = {}
                     if err.get("code") == "unsupported_parameter" and "max_tokens" in err.get("message", ""):
                         payload["max_completion_tokens"] = payload.pop("max_tokens")
+                        response = requests.post(
+                            f"{self.api_base}/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                            timeout=self.timeout,
+                        )
+                    elif (
+                        "response_format" in payload
+                        and err.get("code") == "unsupported_parameter"
+                        and "response_format" in err.get("message", "")
+                    ):
+                        logger.warning("Model/API does not support response_format; retrying without JSON mode.")
+                        payload.pop("response_format", None)
                         response = requests.post(
                             f"{self.api_base}/chat/completions",
                             headers={

@@ -1,0 +1,16 @@
+benchmark: offline
+
+env:
+  OPENAI_MODEL: gpt-5.4-nano
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+args:
+  benchmark: multimodal_mind2web
+  input_file: data/offline/mind2web_eval_100.jsonl
+  output_file: outputs/offline/exp1_baseline_v3_predictions_100.jsonl
+  blocks: data/mind2web_blocks_images/release_images/cross_task
+  model: gpt-5.4-nano
+  api_base: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  temperature: 0.0
