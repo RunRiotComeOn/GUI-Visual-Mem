@@ -601,6 +601,87 @@ def build_visual_skill_v3_record(
     return record
 
 
+def build_visual_skill_v4_record(
+    candidate: VisualSkillCandidate,
+    *,
+    output_dir: str | Path | None = None,
+    draw_example: bool = True,
+) -> dict[str, Any]:
+    """Convert one candidate to the v4 visual episode memory schema.
+
+    v4 stores the concrete action plan from real past trajectories keyed to a
+    specific trigger visual state, not an abstract interaction family.  The VLM
+    selector matches the current screenshot against the trigger state and injects
+    the grounded plan as a planning template.
+    """
+    example_image = ""
+    if output_dir and draw_example:
+        example_image = _write_annotated_example(candidate, Path(output_dir))
+
+    rep = candidate.representative
+    trigger_step = rep.steps[0]
+    action_plan_steps = _v4_action_plan_steps(rep)
+    slot_analysis = _v4_slot_analysis(candidate)
+
+    record = {
+        "version": "visual_skill_v4",
+        "skill_type": "visual_episode_memory",
+        "skill_id": candidate.skill_id,
+        "experience_id": candidate.skill_id,
+        "title": _v4_title(candidate),
+        "signature": candidate.signature,
+        "trigger_visual_state": {
+            "screenshot_path": trigger_step.screenshot_path or None,
+            "visual_cues": trigger_step.visual_cues[:6],
+            "target_role": trigger_step.target_role,
+            "domain": trigger_step.domain,
+            "app": trigger_step.app,
+        },
+        "action_plan": {
+            "steps": action_plan_steps,
+            "plan_description": _v4_plan_description(rep),
+            "num_steps": len(rep.steps),
+            "slot_analysis": slot_analysis,
+        },
+        "applicable_context": {
+            "when": _v4_when(candidate),
+            "visual_triggers": _v4_visual_triggers(candidate),
+            "task_keywords": _v4_task_keywords(candidate),
+            "negative_conditions": _v4_negative_conditions(candidate),
+        },
+        "retrieval": {
+            "query_terms": _v4_query_terms(candidate),
+            "trigger_state_summary": _v4_trigger_state_summary(candidate),
+            "example_tasks": _v4_example_tasks(candidate),
+            "visual_evidence": _v4_visual_evidence(candidate, example_image=example_image),
+        },
+        # Compat fields so existing selector and prompt renderer work unchanged.
+        "target_instruction": _v4_plan_description(rep),
+        "action_guidance": _v4_when(candidate),
+        "action_templates": _action_templates_for(candidate),
+        "value_slots": _value_slots_for(candidate),
+        "expected_postcondition": _postcondition_for(candidate),
+        "forbidden_alternative": _avoid_for(candidate),
+        "example": {
+            "image_path": example_image or None,
+            "bbox": trigger_step.bbox.to_list() if trigger_step.bbox else None,
+            "target_role": trigger_step.target_role,
+            "target_text": trigger_step.target_text,
+        },
+        "support": {
+            "num_occurrences": candidate.support_steps,
+            "num_tasks": candidate.support_tasks,
+            "num_domains": candidate.support_domains,
+            "num_apps": candidate.support_apps,
+            "dominant_roles": candidate.dominant_roles,
+            "dominant_actions": candidate.dominant_actions,
+        },
+        "confidence": candidate.confidence,
+        "source": "offline_visual_skill_mining_v4",
+    }
+    return record
+
+
 def write_visual_skill_store(
     candidates: Sequence[VisualSkillCandidate],
     output_dir: str | Path,
@@ -675,6 +756,45 @@ def write_visual_skill_v3_store(
         "catalog_path": str(catalog_path),
         "num_skills": len(records),
         "version": "visual_skill_v3",
+    }
+
+
+def write_visual_skill_v4_store(
+    candidates: Sequence[VisualSkillCandidate],
+    output_dir: str | Path,
+    *,
+    catalog_cap: int = 200,
+    draw_examples: bool = True,
+) -> dict[str, str | int]:
+    """Write catalog, library, support rows, and trigger images for v4."""
+    out = Path(output_dir)
+    shutil.rmtree(out / "images", ignore_errors=True)
+    shutil.rmtree(out / "support", ignore_errors=True)
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    (out / "support").mkdir(parents=True, exist_ok=True)
+
+    library_path = out / "skill_library.jsonl"
+    catalog_path = out / "catalog.json"
+    records: list[dict[str, Any]] = []
+
+    with library_path.open("w", encoding="utf-8") as library_handle:
+        for candidate in candidates:
+            record = build_visual_skill_v4_record(candidate, output_dir=out, draw_example=draw_examples)
+            records.append(record)
+            library_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            support_path = out / "support" / f"{record['skill_id']}.jsonl"
+            with support_path.open("w", encoding="utf-8") as support_handle:
+                for occurrence in candidate.occurrences:
+                    support_handle.write(json.dumps(occurrence.as_support_dict(), ensure_ascii=False) + "\n")
+
+    catalog = [_catalog_v4_entry(record) for record in records[:catalog_cap]]
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "output_dir": str(out),
+        "library_path": str(library_path),
+        "catalog_path": str(catalog_path),
+        "num_skills": len(records),
+        "version": "visual_skill_v4",
     }
 
 
@@ -775,6 +895,69 @@ def mine_visual_skill_v3_from_files(
     result["num_steps"] = len(steps)
     result["num_inputs"] = len(input_paths)
     result.update(mining_stats)
+    return result
+
+
+def mine_visual_skill_v4_episodes(
+    steps: Sequence[VisualSkillStep],
+    config: VisualSkillMiningConfig | None = None,
+) -> list[VisualSkillCandidate]:
+    """Mine v4 visual episode memories: trigger visual state → concrete action plan.
+
+    Reuses the v2 sliding-window support calculation with multi-step enforcement.
+    The resulting candidates carry real trajectory steps as the plan payload
+    instead of abstract family procedures.
+    """
+    cfg = config or VisualSkillMiningConfig()
+    v4_cfg = VisualSkillMiningConfig(
+        min_support=cfg.min_support,
+        min_tasks=cfg.min_tasks,
+        min_domains=cfg.min_domains,
+        max_segment_len=cfg.max_segment_len,
+        max_examples_per_skill=cfg.max_examples_per_skill,
+        catalog_cap=cfg.catalog_cap,
+        include_single_step_skills=False,
+        filter_low_information_skills=cfg.filter_low_information_skills,
+    )
+    return mine_visual_skill_candidates(steps, v4_cfg)
+
+
+def mine_visual_skill_v4_from_file(
+    input_path: str | Path,
+    output_dir: str | Path,
+    *,
+    dataset: str = "auto",
+    image_root: str | Path | None = None,
+    config: VisualSkillMiningConfig | None = None,
+    draw_examples: bool = True,
+) -> dict[str, str | int]:
+    """End-to-end offline v4 mining helper."""
+    config = config or VisualSkillMiningConfig()
+    steps = load_offline_steps(input_path, dataset=dataset, image_root=image_root)
+    candidates = mine_visual_skill_v4_episodes(steps, config=config)
+    result = write_visual_skill_v4_store(candidates, output_dir, catalog_cap=config.catalog_cap, draw_examples=draw_examples)
+    result["num_steps"] = len(steps)
+    return result
+
+
+def mine_visual_skill_v4_from_files(
+    input_paths: Sequence[str | Path],
+    output_dir: str | Path,
+    *,
+    dataset: str = "auto",
+    image_root: str | Path | None = None,
+    config: VisualSkillMiningConfig | None = None,
+    draw_examples: bool = True,
+) -> dict[str, str | int]:
+    """End-to-end offline v4 mining over multiple trajectory files."""
+    config = config or VisualSkillMiningConfig()
+    steps: list[VisualSkillStep] = []
+    for input_path in input_paths:
+        steps.extend(load_offline_steps(input_path, dataset=dataset, image_root=image_root))
+    candidates = mine_visual_skill_v4_episodes(steps, config=config)
+    result = write_visual_skill_v4_store(candidates, output_dir, catalog_cap=config.catalog_cap, draw_examples=draw_examples)
+    result["num_steps"] = len(steps)
+    result["num_inputs"] = len(input_paths)
     return result
 
 
@@ -948,7 +1131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mine visual skills from offline expert trajectories.")
     parser.add_argument("--input", required=True, nargs="+", help="Input JSON/JSONL trajectory file(s).")
     parser.add_argument("--output-dir", required=True, help="Output visual skill store directory.")
-    parser.add_argument("--version", default="v2", choices=["v2", "v3"], help="Output skill schema version.")
+    parser.add_argument("--version", default="v2", choices=["v2", "v3", "v4"], help="Output skill schema version.")
     parser.add_argument("--dataset", default="auto", choices=["auto", "standard", "android_control", "mind2web"])
     parser.add_argument("--image-root", default="", help="Optional root for relative screenshot paths.")
     parser.add_argument("--min-support", type=int, default=5)
@@ -978,7 +1161,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         v3_keep_single_step_skills=args.v3_keep_single_step,
         v3_subsequence_task_coverage_threshold=args.v3_subsequence_task_coverage_threshold,
     )
-    if args.version == "v3":
+    if args.version == "v4":
+        result = mine_visual_skill_v4_from_files(
+            args.input,
+            args.output_dir,
+            dataset=args.dataset,
+            image_root=args.image_root or None,
+            config=config,
+            draw_examples=not args.no_images,
+        )
+    elif args.version == "v3":
         result = mine_visual_skill_v3_from_files(
             args.input,
             args.output_dir,
@@ -1552,6 +1744,47 @@ def _catalog_v3_entry(record: dict[str, Any]) -> dict[str, Any]:
             "num_tasks": support.get("num_tasks", 0),
             "num_domains": support.get("num_domains", 0),
             "action_pattern_agreement": support.get("action_pattern_agreement", 0),
+        },
+    }
+
+
+def _catalog_v4_entry(record: dict[str, Any]) -> dict[str, Any]:
+    action_plan = record.get("action_plan") or {}
+    context = record.get("applicable_context") or {}
+    retrieval = record.get("retrieval") or {}
+    support = record.get("support") or {}
+    trigger = record.get("trigger_visual_state") or {}
+    roles, actions, value_kinds = _parse_signature_parts(record.get("signature") or "")
+    return {
+        "id": record["skill_id"],
+        "experience_id": record["skill_id"],
+        "skill_id": record["skill_id"],
+        "version": "visual_skill_v4",
+        "skill_type": "visual_episode_memory",
+        "title": record.get("title", ""),
+        "signature": record.get("signature", ""),
+        "when": context.get("when", ""),
+        "visual_triggers": context.get("visual_triggers", [])[:5],
+        "task_keywords": context.get("task_keywords", [])[:10],
+        "plan_description": action_plan.get("plan_description", ""),
+        "num_plan_steps": action_plan.get("num_steps", 0),
+        "example_tasks": retrieval.get("example_tasks", [])[:3],
+        "trigger_state_summary": retrieval.get("trigger_state_summary", ""),
+        "trigger_role": trigger.get("target_role", ""),
+        "roles": roles,
+        "actions": actions,
+        "value_kinds": value_kinds,
+        "sequence_len": len(roles),
+        "requires_bbox": any(a not in _LOCALIZATION_FREE_ACTIONS for a in actions),
+        "retrieval": {
+            "query_terms": retrieval.get("query_terms", [])[:12],
+            "trigger_state_summary": retrieval.get("trigger_state_summary", ""),
+            "example_tasks": retrieval.get("example_tasks", [])[:3],
+        },
+        "support": {
+            "num_occurrences": support.get("num_occurrences", 0),
+            "num_tasks": support.get("num_tasks", 0),
+            "num_domains": support.get("num_domains", 0),
         },
     }
 
@@ -2398,6 +2631,188 @@ def _avoid_for(candidate: VisualSkillCandidate) -> str:
     if any(role == "confirm_button" for role in candidate.dominant_roles):
         return "Do not leave the current panel before committing the visible change."
     return "Do not use this skill when the target role or value slot is only a weak visual match."
+
+
+def _v4_title(candidate: VisualSkillCandidate) -> str:
+    roles = " + ".join(r.replace("_", " ").title() for r in candidate.dominant_roles[:2])
+    actions = " + ".join(a.replace("_", " ").title() for a in candidate.dominant_actions[:2])
+    num_steps = len(candidate.representative.steps)
+    return f"{actions} via {roles} ({num_steps}-step plan, {candidate.support_tasks} tasks)"
+
+
+def _v4_when(candidate: VisualSkillCandidate) -> str:
+    trigger = candidate.representative.steps[0]
+    cue = trigger.visual_cues[0][:60] if trigger.visual_cues else trigger.target_role.replace("_", " ")
+    num_steps = len(candidate.representative.steps)
+    roles = " + ".join(candidate.dominant_roles[:2])
+    return (
+        f"Apply when the current screen shows '{cue}' and the task requires "
+        f"a {num_steps}-step sequence involving {roles}."
+    )
+
+
+def _v4_visual_triggers(candidate: VisualSkillCandidate) -> list[str]:
+    trigger = candidate.representative.steps[0]
+    cues: list[str] = list(trigger.visual_cues[:4])
+    if trigger.target_role not in cues:
+        cues.insert(0, trigger.target_role)
+    return cues[:5]
+
+
+def _v4_task_keywords(candidate: VisualSkillCandidate) -> list[str]:
+    token_counter: Counter[str] = Counter()
+    _stopwords = {"the", "and", "for", "with", "from", "that", "this", "into", "then", "click", "find"}
+    for occ in candidate.occurrences:
+        if occ.steps:
+            for tok in re.findall(r"[a-z][a-z0-9_-]{2,}", occ.steps[0].task.lower()):
+                if tok not in _stopwords:
+                    token_counter[tok] += 1
+    return [tok for tok, _ in token_counter.most_common(10)]
+
+
+def _v4_example_tasks(candidate: VisualSkillCandidate) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for occ in candidate.occurrences:
+        task = (occ.steps[0].task if occ.steps else "")[:120]
+        if task and task not in seen:
+            seen.add(task)
+            result.append(task)
+        if len(result) >= 4:
+            break
+    return result
+
+
+def _v4_trigger_state_summary(candidate: VisualSkillCandidate) -> str:
+    trigger = candidate.representative.steps[0]
+    cue = trigger.visual_cues[0][:60] if trigger.visual_cues else trigger.target_text[:60]
+    return f"{trigger.target_role} in {trigger.app} ({trigger.domain}): {cue}"
+
+
+def _v4_query_terms(candidate: VisualSkillCandidate) -> list[str]:
+    terms: set[str] = set()
+    for role in candidate.dominant_roles[:3]:
+        terms.update(role.split("_"))
+    for action in candidate.dominant_actions[:3]:
+        terms.add(action)
+    _stopwords = {"the", "and", "for", "with", "from"}
+    for occ in candidate.occurrences[:5]:
+        if occ.steps:
+            for tok in re.findall(r"[a-z][a-z0-9]{2,}", occ.steps[0].task.lower()):
+                if tok not in _stopwords:
+                    terms.add(tok)
+    return sorted(terms)[:16]
+
+
+def _v4_negative_conditions(candidate: VisualSkillCandidate) -> list[str]:
+    conditions = ["Do not apply if task requires only a single click or simple navigation."]
+    if "input_text" in candidate.dominant_actions:
+        conditions.append("Do not apply if no text input is needed for this step.")
+    return conditions
+
+
+def _v4_action_plan_steps(occurrence: VisualSkillOccurrence) -> list[dict[str, Any]]:
+    result = []
+    for i, step in enumerate(occurrence.steps):
+        value = step.action_value or ""
+        target_desc = (step.target_text or step.target_role)[:80]
+        if step.action_type == "input_text":
+            slot_hint = f"[{step.value_kind.upper()}]" if step.value_kind not in ("none", "") else "[TEXT]"
+            description = f"Type {slot_hint} into {step.target_role}: {target_desc}"
+        elif step.action_type in ("click", "select"):
+            description = f"Click {step.target_role}: {target_desc}"
+            slot_hint = ""
+        elif step.action_type == "hover":
+            description = f"Hover {step.target_role}: {target_desc}"
+            slot_hint = ""
+        elif step.action_type == "scroll":
+            description = f"Scroll ({value or 'direction'})"
+            slot_hint = ""
+        elif step.action_type == "press_key":
+            description = f"Press {value or 'key'}"
+            slot_hint = ""
+        else:
+            description = f"{step.action_type} {step.target_role}: {target_desc}"
+            slot_hint = ""
+        result.append({
+            "step_index": i,
+            "action_type": step.action_type,
+            "target_role": step.target_role,
+            "example_value": value[:60] or None,
+            "slot_hint": slot_hint,
+            "description": description,
+        })
+    return result
+
+
+def _v4_plan_description(occurrence: VisualSkillOccurrence) -> str:
+    parts = []
+    for step in occurrence.steps:
+        value = step.action_value or ""
+        if step.action_type == "input_text":
+            parts.append(f"type {repr(value[:30]) if value else '[text]'} into {step.target_role}")
+        elif step.action_type in ("click", "select"):
+            label = (step.target_text or step.target_role)[:40]
+            parts.append(f"click {label}")
+        elif step.action_type == "hover":
+            label = (step.target_text or step.target_role)[:40]
+            parts.append(f"hover {label}")
+        elif step.action_type == "scroll":
+            parts.append(f"scroll ({value or ''})")
+        elif step.action_type == "press_key":
+            parts.append(f"press {value or 'key'}")
+        else:
+            parts.append(f"{step.action_type} {step.target_role}")
+    return " → ".join(parts)
+
+
+def _v4_slot_analysis(candidate: VisualSkillCandidate) -> list[dict[str, Any]]:
+    num_steps = len(candidate.representative.steps)
+    result = []
+    for i in range(num_steps):
+        step = candidate.representative.steps[i]
+        values_at_step = [
+            occ.steps[i].action_value
+            for occ in candidate.occurrences
+            if len(occ.steps) > i
+        ]
+        unique_values = list({v for v in values_at_step if v})
+        is_slot = step.action_type == "input_text" and len(unique_values) > 1
+        slot_name = f"{step.target_role.upper()}_VALUE" if is_slot else ""
+        result.append({
+            "step_index": i,
+            "action_type": step.action_type,
+            "target_role": step.target_role,
+            "is_slot": is_slot,
+            "slot_name": slot_name,
+            "example_values": unique_values[:4] if is_slot else [],
+            "fixed_example": values_at_step[0] if not is_slot and values_at_step else None,
+        })
+    return result
+
+
+def _v4_visual_evidence(candidate: VisualSkillCandidate, *, example_image: str = "") -> list[dict[str, Any]]:
+    evidence = []
+    rep = candidate.representative
+    if rep.steps:
+        evidence.append({
+            "image_path": example_image or rep.steps[0].screenshot_path or None,
+            "trigger_role": rep.steps[0].target_role,
+            "task": rep.steps[0].task[:80],
+            "domain": rep.domain,
+            "app": rep.app,
+        })
+    for occ in candidate.occurrences[1:3]:
+        if occ is rep or not occ.steps:
+            continue
+        evidence.append({
+            "image_path": occ.steps[0].screenshot_path or None,
+            "trigger_role": occ.steps[0].target_role,
+            "task": occ.steps[0].task[:80],
+            "domain": occ.domain,
+            "app": occ.app,
+        })
+    return evidence
 
 
 def _has_any(text: str, needles: Sequence[str]) -> bool:

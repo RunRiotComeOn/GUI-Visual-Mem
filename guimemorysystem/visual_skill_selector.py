@@ -40,6 +40,11 @@ Important assumptions:
   progress, for example a dropdown is open after the previous click.
 - v3 skills are UI planning skills: historical images are matching evidence,
   but the useful payload is the procedure/preconditions/failure recovery.
+- v4 skills are visual episode memories: each skill stores the trigger visual
+  state (screenshot) where planning started, plus the concrete action plan that
+  followed in real past trajectories. Match the current screenshot against the
+  trigger state visually and by task relevance. If matched, the action_plan.steps
+  are a grounded planning template — adapt slot values to the current task.
 - The catalog shortlist is not exhaustive. Prefer no skill over a weak match.
 
 Selection rules:
@@ -300,6 +305,9 @@ def render_selected_visual_skills(selected: Sequence[SelectedVisualSkill]) -> st
     ]
     for idx, item in enumerate(selected, start=1):
         record = item.record or {}
+        if record.get("version") == "visual_skill_v4":
+            lines.extend(_render_selected_v4_skill(idx, item, record))
+            continue
         if record.get("version") == "visual_skill_v3":
             lines.extend(_render_selected_v3_skill(idx, item, record))
             continue
@@ -362,6 +370,48 @@ def _render_selected_v3_skill(idx: int, item: SelectedVisualSkill, record: dict[
         lines.append("   recovery: " + " | ".join(str(x) for x in recovery[:4]))
     if item.slot_values:
         lines.append("   filled_slots: " + json.dumps(item.slot_values, ensure_ascii=False))
+    return lines
+
+
+def _render_selected_v4_skill(idx: int, item: SelectedVisualSkill, record: dict[str, Any]) -> list[str]:
+    action_plan = record.get("action_plan") or {}
+    context = record.get("applicable_context") or {}
+    retrieval = record.get("retrieval") or {}
+    plan_steps = action_plan.get("steps") or []
+    slot_analysis = action_plan.get("slot_analysis") or []
+
+    lines = [
+        f"{idx}. {record.get('title') or item.skill_id}",
+        f"   skill_id: {item.skill_id}",
+        f"   type: visual_episode_memory",
+        f"   selector_reason: {item.reason}",
+        f"   current_state_match: {item.matched_visual_evidence}",
+    ]
+    if item.matched_skill_evidence:
+        lines.append(f"   past_trigger_match: {item.matched_skill_evidence}")
+    when = context.get("when", "")
+    if when:
+        lines.append(f"   trigger_condition: {when}")
+    example_tasks = retrieval.get("example_tasks") or []
+    if example_tasks:
+        lines.append("   past_tasks_like: " + " | ".join(str(t)[:70] for t in example_tasks[:2]))
+    lines.append(f"   past_plan ({action_plan.get('num_steps', len(plan_steps))} steps from real trajectories):")
+    for step in plan_steps[:6]:
+        slot = step.get("slot_hint", "")
+        desc = step.get("description", "")
+        suffix = f"  ← fill {slot}" if slot else ""
+        lines.append(f"     {step.get('step_index', 0) + 1}. {desc}{suffix}")
+    slots_needed = [s for s in slot_analysis if s.get("is_slot")]
+    if slots_needed:
+        slot_strs = [
+            f"[{s['slot_name']}]={item.slot_values.get(s['slot_name'], '?')} (e.g. {s['example_values'][0] if s.get('example_values') else '?'})"
+            for s in slots_needed
+        ]
+        lines.append("   adapt_slots: " + ", ".join(slot_strs))
+    elif item.slot_values:
+        lines.append("   filled_slots: " + json.dumps(item.slot_values, ensure_ascii=False))
+    if item.suggested_plan:
+        lines.append(f"   selector_adapted_plan: {item.suggested_plan}")
     return lines
 
 
@@ -455,6 +505,12 @@ def _catalog_entry_score(
             " ".join(str(x) for x in entry.get("procedure") or []),
             _retrieval_entry_text(entry.get("retrieval") or {}),
             " ".join(str(x) for x in entry.get("visual_cues") or []),
+            # v4-specific fields
+            str(entry.get("plan_description") or ""),
+            str(entry.get("trigger_state_summary") or ""),
+            " ".join(str(x) for x in entry.get("task_keywords") or []),
+            " ".join(str(t)[:60] for t in (entry.get("example_tasks") or [])),
+            " ".join(str(x) for x in entry.get("visual_triggers") or []),
             signature,
         ]
     ).lower()
@@ -527,43 +583,77 @@ def _format_visual_skill_catalog(catalog: Sequence[dict[str, Any]]) -> str:
         skill_id = _entry_id(entry)
         if not skill_id:
             continue
+        version = entry.get("version", "")
         support = entry.get("support") or {}
-        retrieval = entry.get("retrieval") or {}
-        procedure = entry.get("procedure") or []
-        preconditions = entry.get("preconditions") or []
-        lines.append(
-            (
-                "{idx}. skill_id={skill_id}\n"
-                "   version={version}\n"
-                "   title={title}\n"
-                "   intent={intent}\n"
-                "   signature={signature}\n"
-                "   when={when}\n"
-                "   preconditions={preconditions}\n"
-                "   procedure={procedure}\n"
-                "   retrieval_summary={retrieval_summary}\n"
-                "   visual_cues={visual_cues}\n"
-                "   support=tasks:{tasks}, domains:{domains}, segments:{segments}, occurrences:{occurrences}\n"
-                "   retrieval_score={score}"
-            ).format(
-                idx=idx,
-                skill_id=skill_id,
-                version=entry.get("version", ""),
-                title=entry.get("title", ""),
-                intent=entry.get("intent", ""),
-                signature=entry.get("signature", ""),
-                when=entry.get("when", ""),
-                preconditions=" | ".join(str(x) for x in preconditions[:4]),
-                procedure=" | ".join(str(x) for x in procedure[:4]),
-                retrieval_summary=retrieval.get("page_state_summary", ""),
-                visual_cues=", ".join(str(x) for x in (entry.get("visual_cues") or entry.get("page_state_cues") or [])[:5]),
-                tasks=support.get("num_tasks", ""),
-                domains=support.get("num_domains", ""),
-                segments=support.get("num_trajectory_segments", ""),
-                occurrences=support.get("num_occurrences", ""),
-                score=entry.get("_retrieval_score", ""),
+        if version == "visual_skill_v4":
+            retrieval = entry.get("retrieval") or {}
+            example_tasks = retrieval.get("example_tasks") or entry.get("example_tasks") or []
+            lines.append(
+                (
+                    "{idx}. skill_id={skill_id}\n"
+                    "   version=visual_skill_v4  type=visual_episode_memory\n"
+                    "   title={title}\n"
+                    "   trigger_state={trigger_summary}\n"
+                    "   when={when}\n"
+                    "   plan={plan_desc}\n"
+                    "   num_plan_steps={num_steps}\n"
+                    "   visual_triggers={visual_triggers}\n"
+                    "   example_tasks={example_tasks}\n"
+                    "   support=tasks:{tasks}, domains:{domains}, occurrences:{occurrences}\n"
+                    "   retrieval_score={score}"
+                ).format(
+                    idx=idx,
+                    skill_id=skill_id,
+                    title=entry.get("title", ""),
+                    trigger_summary=entry.get("trigger_state_summary", ""),
+                    when=entry.get("when", ""),
+                    plan_desc=entry.get("plan_description", ""),
+                    num_steps=entry.get("num_plan_steps", ""),
+                    visual_triggers=", ".join(str(x) for x in (entry.get("visual_triggers") or [])[:4]),
+                    example_tasks=" | ".join(str(t)[:60] for t in example_tasks[:2]),
+                    tasks=support.get("num_tasks", ""),
+                    domains=support.get("num_domains", ""),
+                    occurrences=support.get("num_occurrences", ""),
+                    score=entry.get("_retrieval_score", ""),
+                )
             )
-        )
+        else:
+            retrieval = entry.get("retrieval") or {}
+            procedure = entry.get("procedure") or []
+            preconditions = entry.get("preconditions") or []
+            lines.append(
+                (
+                    "{idx}. skill_id={skill_id}\n"
+                    "   version={version}\n"
+                    "   title={title}\n"
+                    "   intent={intent}\n"
+                    "   signature={signature}\n"
+                    "   when={when}\n"
+                    "   preconditions={preconditions}\n"
+                    "   procedure={procedure}\n"
+                    "   retrieval_summary={retrieval_summary}\n"
+                    "   visual_cues={visual_cues}\n"
+                    "   support=tasks:{tasks}, domains:{domains}, segments:{segments}, occurrences:{occurrences}\n"
+                    "   retrieval_score={score}"
+                ).format(
+                    idx=idx,
+                    skill_id=skill_id,
+                    version=version,
+                    title=entry.get("title", ""),
+                    intent=entry.get("intent", ""),
+                    signature=entry.get("signature", ""),
+                    when=entry.get("when", ""),
+                    preconditions=" | ".join(str(x) for x in preconditions[:4]),
+                    procedure=" | ".join(str(x) for x in procedure[:4]),
+                    retrieval_summary=retrieval.get("page_state_summary", ""),
+                    visual_cues=", ".join(str(x) for x in (entry.get("visual_cues") or entry.get("page_state_cues") or [])[:5]),
+                    tasks=support.get("num_tasks", ""),
+                    domains=support.get("num_domains", ""),
+                    segments=support.get("num_trajectory_segments", ""),
+                    occurrences=support.get("num_occurrences", ""),
+                    score=entry.get("_retrieval_score", ""),
+                )
+            )
     return "\n".join(lines) if lines else "(empty)"
 
 
@@ -620,6 +710,10 @@ def _record_evidence_image_paths(record: dict[str, Any]) -> list[str]:
     for item in retrieval.get("visual_evidence") or []:
         if isinstance(item, dict) and item.get("image_path"):
             paths.append(str(item["image_path"]))
+    # v4: also check trigger_visual_state and action_plan.visual_evidence
+    trigger = record.get("trigger_visual_state") or {}
+    if trigger.get("screenshot_path"):
+        paths.append(str(trigger["screenshot_path"]))
     example = record.get("example") or {}
     if example.get("image_path"):
         paths.append(str(example["image_path"]))
