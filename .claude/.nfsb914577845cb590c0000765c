@@ -24,7 +24,8 @@
       "Bash(python evaluation/offline_evaluation/Multimodal-Mind2Web/eval_guimem.py --pred_file outputs/offline/exp4_both_predictions.jsonl --label exp4_both)",
       "Bash(python3 *)",
       "Bash(python *)",
-      "Bash(xargs -I{} sh -c 'echo \"=== {} ===\"; wc -l {}; head -1 {} | python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\(list\\(d.keys\\(\\)\\)\\)\"')"
+      "Bash(xargs -I{} sh -c 'echo \"=== {} ===\"; wc -l {}; head -1 {} | python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\(list\\(d.keys\\(\\)\\)\\)\"')",
+      "Bash(chmod +x /u/yhuang48/GUIMem/scripts/run_offline_mind2web_experiments_v4.sbatch)"
     ]
   }
 }

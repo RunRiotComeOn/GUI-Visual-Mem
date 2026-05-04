@@ -121,11 +121,12 @@ def run_multimodal_mind2web(args, config: MemoryAdapterConfig) -> None:
             policy.reset(task_desc)
 
             for row in task_rows:
-                # Seed previous_actions from dataset ground truth so the
-                # action-history context is consistent with the baseline.
-                # In-task memory accumulates separately via commit().
-                previous_actions = row.get("previous_actions_descriptions", row.get("previous_actions", [])) or []
-                policy.previous_actions = [str(a) for a in previous_actions]
+                if not args.no_seed_previous_actions:
+                    # Seed previous_actions from dataset ground truth so the
+                    # action-history context is consistent with the baseline.
+                    # In-task memory accumulates separately via commit().
+                    previous_actions = row.get("previous_actions_descriptions", row.get("previous_actions", [])) or []
+                    policy.previous_actions = [str(a) for a in previous_actions]
 
                 target_blocks = row.get("target_blocks", []) or []
                 max_target = max([int(item) for item in target_blocks], default=-1)
@@ -182,6 +183,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api_base", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
     parser.add_argument("--api_key", default=os.getenv("OPENAI_API_KEY", ""))
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--no_seed_previous_actions",
+        action="store_true",
+        help="Do not seed policy.previous_actions from dataset ground truth between steps; "
+             "let in-task memory and policy.commit() be the only source of action history.",
+    )
     return parser.parse_args()
 
 
