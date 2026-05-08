@@ -150,10 +150,11 @@ def run_multimodal_mind2web(args, config: MemoryAdapterConfig) -> None:
                 description, action_type, value = _extract_action_fields(result.action_data)
                 width, height = image.size
 
-                # Commit the final action so in-task memory updates before the
-                # next step's prepare_step() call.
-                action_repr = _field_text(result.action_data.get("action_target") or description) or f"{action_type} {value}".strip()
-                policy.commit(action_repr)
+                if not args.no_commit_history:
+                    # Commit the final action so in-task memory updates before
+                    # the next step's prepare_step() call.
+                    action_repr = _field_text(result.action_data.get("action_target") or description) or f"{action_type} {value}".strip()
+                    policy.commit(action_repr)
 
                 record = dict(row)
                 record.update(
@@ -188,6 +189,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not seed policy.previous_actions from dataset ground truth between steps; "
              "let in-task memory and policy.commit() be the only source of action history.",
+    )
+    parser.add_argument(
+        "--no_commit_history",
+        action="store_true",
+        help="Do not call policy.commit() between steps. This leaves later steps with no self-generated "
+             "history or in-task transition memory unless another source is explicitly provided.",
     )
     return parser.parse_args()
 

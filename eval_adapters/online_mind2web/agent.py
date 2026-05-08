@@ -29,7 +29,7 @@ from syn.data import (
 )
 
 from policy import MemoryAugmentedPolicy, OpenAICompatibleEngine
-from guimemorysystem import load_catalog, load_library_by_id
+from guimemorysystem import load_catalog, load_library_by_id, load_visual_skill_store
 from guimemorysystem.online_experience import (
     OnlineExperienceStoreConfig,
     update_online_experience_store,
@@ -84,6 +84,14 @@ class MemoryAgentConfig(AgentConfig):
     selector_rate_limit: int = field(default=-1, kw_only=True)
     experience_catalog_path: str = field(default="", kw_only=True)
     experience_library_path: str = field(default="", kw_only=True)
+    # If set, loads (catalog, library) from a visual-skill store and switches
+    # the policy into use_visual_skill mode. Takes precedence over the textual
+    # experience_catalog_path / experience_library_path pair when both are set.
+    visual_skill_store_path: str = field(default="", kw_only=True)
+    # When >0, _cot_step early-exits with STOP after this many consecutive
+    # blocked-state detections (CAPTCHA / access-denied / cloudflare / etc.),
+    # so a doomed task quits long before max_steps. 0 disables the check.
+    blocked_exit_streak: int = field(default=2, kw_only=True)
 
     # Online Stage-A/B writer. Enabled only when online_experience_enabled is
     # true; successful trajectories are summarized and upserted into these
@@ -151,7 +159,24 @@ class MemoryAugmentedAgent(_BaseAgent):
         selector_engine = None
         experience_catalog = None
         experience_library = None
-        if (
+        use_visual_skill = False
+        if config.selector_model and config.visual_skill_store_path:
+            selector_engine = OpenAICompatibleEngine(
+                model=config.selector_model,
+                api_base=config.selector_api_base,
+                api_key=config.selector_api_key or os.getenv("OPENAI_API_KEY", ""),
+                rate_limit=config.selector_rate_limit,
+            )
+            experience_catalog, experience_library = load_visual_skill_store(
+                config.visual_skill_store_path
+            )
+            use_visual_skill = True
+            logger.info(
+                "loaded visual-skill store from %s (n_catalog=%d, n_library=%d)",
+                config.visual_skill_store_path,
+                len(experience_catalog), len(experience_library),
+            )
+        elif (
             config.selector_model
             and config.experience_catalog_path
             and config.experience_library_path
@@ -177,8 +202,10 @@ class MemoryAugmentedAgent(_BaseAgent):
             experience_library=experience_library,
             recent_k=config.memory_recent_k,
             last_k_actions=config.history_last_k or 15,
+            use_visual_skill=use_visual_skill,
         )
         self._policy_task: str | None = None
+        self._blocked_streak: int = 0
 
         self._online_experience_engine = None
         self._online_experience_store_config = None
@@ -248,7 +275,12 @@ class MemoryAugmentedAgent(_BaseAgent):
             state = {"start_url": start_url, "storage_state": storage_state}
             json.dump(state, f)
             logger.info(f"Resetting environment with state: {state}")
-        observation, info = env.reset(options={"config_file": f"{self.config.output}/init_env.json"})
+
+        if getattr(env, "reset_finished", False) and storage_state is None:
+            observation, info = self._navigate_existing_env(env, start_url)
+        else:
+            observation, info = env.reset(options={"config_file": f"{self.config.output}/init_env.json"})
+
         env.context.set_default_timeout(30000)
         env.context.set_default_navigation_timeout(60000)
 
@@ -256,6 +288,50 @@ class MemoryAugmentedAgent(_BaseAgent):
             if self._maybe_handle_common_blockers(env):
                 observation = env._get_obs()
                 info["observation_metadata"] = env._get_obs_metadata()
+        return observation, info
+
+    def _navigate_existing_env(self, env, start_url: str):
+        """Move an already-open browser to a new task without restarting Playwright."""
+        from browser_env.envs import DetachedPage
+
+        start_urls = start_url.split(" |AND| ")
+        pages = list(env.context.pages)
+        if not pages:
+            pages = [env.context.new_page()]
+
+        for page in pages[len(start_urls):]:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        pages = list(env.context.pages)
+        while len(pages) < len(start_urls):
+            pages.append(env.context.new_page())
+
+        for idx, url in enumerate(start_urls):
+            page = pages[idx]
+            try:
+                client = page.context.new_cdp_session(page)
+                if env.text_observation_type == "accessibility_tree":
+                    client.send("Accessibility.enable")
+                page.client = client  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        env.page = env.context.pages[0]
+        env.page.bring_to_front()
+        if env.sleep_after_execution > 0:
+            time.sleep(env.sleep_after_execution)
+
+        observation = env._get_obs()
+        observation_metadata = env._get_obs_metadata()
+        info = {
+            "page": DetachedPage(env.page.url, ""),
+            "fail_error": "",
+            "observation_metadata": observation_metadata,
+        }
         return observation, info
 
     def _maybe_handle_common_blockers(self, env) -> bool:
@@ -342,7 +418,28 @@ class MemoryAugmentedAgent(_BaseAgent):
         if self._policy_task != task:
             self.policy.reset(task)
             self._policy_task = task
+            self._blocked_streak = 0
         self._sync_committed_actions(previous_traj)
+
+        if self._memory_config.blocked_exit_streak > 0 and self._state_looks_blocked(current_state):
+            self._blocked_streak += 1
+            if self._blocked_streak >= self._memory_config.blocked_exit_streak:
+                logger.warning(
+                    "blocked-state streak=%d on task=%s; aborting via STOP",
+                    self._blocked_streak, task,
+                )
+                return LowLevelTask(
+                    task="page appears blocked (captcha/access-denied); aborting",
+                    action=Action(
+                        element=None,
+                        action_type=ActionType.STOP,
+                        value="blocked page detected; early exit",
+                    ),
+                    curr_state=current_state,
+                    task_status=LowTaskStatus.IN_PROGRESS,
+                )
+        else:
+            self._blocked_streak = 0
 
         try:
             result = self.policy.step(screenshot)
@@ -455,6 +552,20 @@ class MemoryAugmentedAgent(_BaseAgent):
         )
 
     # -------------------------------------------------------- online Stage A/B
+
+    def _state_looks_blocked(self, current_state: StateInfo) -> bool:
+        if current_state is None or current_state.raw_state is None:
+            return False
+        # URL is the strongest cheap signal (e.g. .../captcha, /blocked, ...).
+        # Accessibility tree catches the rendered "Verify you are human" text
+        # on Cloudflare interstitials and similar pages.
+        for value in (
+            current_state.raw_state.url or "",
+            current_state.raw_state.accessibility_tree or "",
+        ):
+            if value and _BLOCKED_FINAL_RE.search(str(value)):
+                return True
+        return False
 
     def _looks_like_blocked_completion(self, high_level_task: HighLevelTask) -> bool:
         if not high_level_task.trajectories:

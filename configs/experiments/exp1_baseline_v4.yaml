@@ -14,3 +14,5 @@ args:
   api_base: https://api.openai.com/v1
   api_key: ${OPENAI_API_KEY}
   temperature: 0.0
+  no_seed_previous_actions: true
+  no_commit_history: true
